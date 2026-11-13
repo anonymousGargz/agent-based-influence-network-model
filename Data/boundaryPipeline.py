@@ -11,6 +11,8 @@ import pandas as pd
 SHP_FILE = r"C:\Users\gnisa\Documents\Third Year Project\Data\nazi_wgs84.shp"
 
 gdf = gpd.read_file(SHP_FILE)
+#Repairs invalid geometries
+gdf["geometry"] = gdf.geometry.make_valid()
 
 print("First five rows:")
 print(gdf.head())
@@ -37,16 +39,32 @@ print("\nNumber of geographic features:", len(gdf))
 
 # ---------------------------------------
 # determine Kreise in the Saar by listing all Kreise in a CSV file and then checking which ones to filter
-# Basically discovered that if it's occupied by France it all comes under the label "OccupiedByFrance"
+# Basically discovered that if it's occupied by France it all comes under the label "OccupiedByFrance"- these 8 
+# individual Kreise have been labelled under one "OccupiedByFrance" label, so that's why the features labelled has
+# just been reduced by one
 # ---------------------------------------------------------------------
 kreise = gdf["KREISE"].dropna().unique()
 pd.Series(sorted(kreise), name="KREISE").to_csv("kreise.csv", index=False, encoding="utf-8-sig")
+print("Before removal:", len(gdf))
 
+# Identify Saar Territory
 saar = gdf[gdf["KREISE"] == "OccupiedByFrance"]
 
-print("Number of Saar features:", len(saar))
-gdf = gdf[~gdf["KREISE"].isin(saar_kreise)]
-# --------------------------------------------------
+print("Features labelled OccupiedByFrance:", len(saar))
+
+# Remove Saar Territory
+gdf = gdf[gdf["KREISE"] != "OccupiedByFrance"].copy()
+
+gdf["poly_id"]=range(len(gdf))
+
+print("After removal:", len(gdf))
+
+# Verify
+print("Remaining OccupiedByFrance:",
+      (gdf["KREISE"] == "OccupiedByFrance").sum())
+
+gdf.to_file("boundaries_clean.gpkg")
+#----------------------------------
 # 2. Plot shapefile using Matplotlib
 # --------------------------------------------------
 
