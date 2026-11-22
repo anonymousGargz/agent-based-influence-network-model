@@ -90,7 +90,7 @@ def place_name(za_name):
     for w in s.split():
         #Skip S/L markers, Berlin "BA" and anything with a digit (BA numbers, dates)
         
-        if w in ["S", "L", "BA", "-"] or digi:
+        if w in ["S", "L", "BA", "-"] or any(ch.isdigit() for ch in w):
             continue
         keep.append(w)
     return clean(" ".join(keep))
@@ -100,8 +100,72 @@ missing_units["key"] = missing_units["name"].map(place_name)
 
 # Build the GeoNames dictionary 
 # This turns GeoNames' big table into a dictionary you can lookup a name in and find the coordinates
-cols=["geonameid", "name" "asciiname", "alternatenames", "lat", "lon", "feature_class", "feature_code", "country", "cc2",
-      "admin1", "admin2", "admin3", "admin4", "population", ]
+cols = ["geonameid", "name", "asciiname", "alternatenames", "lat", "lon",
+        "feature_class", "feature_code", "country", "cc2", "admin1", "admin2",
+        "admin3", "admin4", "population", "elevation", "dem", "timezone", "modified"]
 
-# Geonames source: https://download.geonames.org/export/dump/
+# GeoNames files have no header row, so we name the 19 columns ourselves (order from the GeoNames readme)
 
+frames=[]
+for country in ["DE", "PL", "RU"]:
+    gn = pd.read_csv(DIR + country + ".txt",
+                     sep="\t", header=None, names=cols, usecols=["name", "asciiname", "alternatenames",
+                                                                 "lat", "lon", "feature_class", "population"],
+                        dtype=str, quoting=3, keep_default_na=False)
+    # tab-separated, no header
+    # only what we need
+    # read everything as text
+    # ignore stray quote marks in names
+    #empty cells stay "" instead of NaN
+
+
+    frames.append(gn)
+
+gn=pd.concat(frames)
+
+gn=gn[gn["feature_class"]== "P"] # P= populated places
+print (len(gn), "populated places")
+
+places= {}
+for row in gn.itertuples(): # one place at a time
+    # every name this place goes by
+    names = [row.name, row.asciiname] + row.alternatenames.split(",")
+    keys=set(clean(n) for n in names if n!="") #set: same key from two names only counts on
+    if row.population != "":
+        pop= int(row.population)
+    else:
+        pop=0
+    for key in keys:
+        if key== "":
+            continue
+        if key not in places:
+            places[key]=[] # first time we see this name: start a list
+        places[key].append((float(row.lat), float(row.lon), pop)) # many places can share a name, so keep them all
+print(len(places), "distinct names")
+print(places.get("stolp"))
+
+
+#3. Attach candidate coordinates to each missig unit
+
+#look up eah key: .get(k, []) gives an empty list if the name isn't in GeoNames at all
+missing_units["candidates"] = missing_units["key"].map(lambda k: places.get(k, []))
+missing_units["n_cand"]= missing_units["candidates"].map(len)
+
+print((missing_units["n_cand"]==0).sum(), "with no candidate") #these go to manual review
+print((missing_units["n_cand"]>1).sum(), "with several candidatrs") #Wahlkreis check picks one in 4.5
+
+
+#explode: a unit with 3 candidates become 3 rows, one per candidate
+cand = missing_units.explode("candidates")
+cand = cand[cand["candidates"].notna()]
+
+#split each (lat, lon, pop) tuple into its own column
+cand["lat"]= cand["candidates"].map(lambda c: c[0])
+cand["lon"] = cand["candidates"].map(lambda c: c[1])
+cand["gn_pop"]= cand["candidates"].map(lambda c: c[2])
+
+print(len(cand), "candidate rows")
+print(cand[["unit_id", "name", "wahlkreis", "lat", "lon", "gn_pop"]].head(10))
+
+#Hmm something is going wrong
+# I dom't really know what to fix
