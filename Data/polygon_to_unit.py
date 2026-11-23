@@ -54,6 +54,7 @@ diff= diff.merge(kreis_raw[["kreis_id", "pop_1928"]], on="kreis_id", how="left")
 
 missing_units=diff.sort_values("pop_1928", ascending=False)
 missing_units=missing_units[["unit_id", "kreis_id", "name", "level", "wahlkreis", "pop_1928"]]
+missing_units=missing_units.rename(columns={"unit_id": "missing_unit_id"})
 
 #4.b Now I need to find a search name/ coordinates for each missing unit
 # I'm re-using the clean and remove bracket functions from the match_boundaries.py
@@ -150,7 +151,12 @@ print(places.get("stolp"))
 #look up eah key: .get(k, []) gives an empty list if the name isn't in GeoNames at all
 missing_units["candidates"] = missing_units["key"].map(lambda k: places.get(k, []))
 missing_units["n_cand"]= missing_units["candidates"].map(len)
-
+ # Removes duplicate missing_unit_id rows
+missing_units = missing_units.drop_duplicates(
+    subset="missing_unit_id",
+    keep="first"
+).copy()
+assert len(missing_units) == 254
 print((missing_units["n_cand"]==0).sum(), "with no candidate") #these go to manual review
 print((missing_units["n_cand"]>1).sum(), "with several candidatrs") #Wahlkreis check picks one in 4.5
 
@@ -165,7 +171,301 @@ cand["lon"] = cand["candidates"].map(lambda c: c[1])
 cand["gn_pop"]= cand["candidates"].map(lambda c: c[2])
 
 print(len(cand), "candidate rows")
-print(cand[["unit_id", "name", "wahlkreis", "lat", "lon", "gn_pop"]].head(10))
+print(cand[["missing_unit_id", "name", "wahlkreis", "lat", "lon", "gn_pop"]].head(10))
 
-#Hmm something is going wrong
-# I dom't really know what to fix
+
+# 4.5 ------------------------------- 4.5 IS AI GENERATED
+# ONLY auto-assign when candidates point to exactly one host
+#1. Give every candidate its own ID
+cand= cand.reset_index(drop=True)
+cand["cand_id"]= range(len(cand))
+
+#2. The 749 nodes, with their Wahlkreis
+# One Wahlkreis per unit (Kreise in the same unit are in the same Wahlkreis)
+unit_wk= lookup.dropna(subset=["unit_id"]).drop_duplicates("unit_id")[["unit_id", "wahlkreis"]]
+
+nodes= merged_geo_dissolved[["unit_id", "geometry"]].merge(unit_wk)
+#Rename so they don't clash with the candidate's own wahlkreis after the join
+nodes= nodes.rename(columns={"unit_id": "node_id", "wahlkreis": "host_wahlkreis" })
+
+
+# 3. Which shape does each candidate point fall in?
+
+points = gpd.GeoDataFrame(
+    cand,
+    geometry=gpd.points_from_xy(cand["lon"], cand["lat"]),
+    crs="EPSG:4326"
+)
+
+# Ensure points and polygons share the same CRS
+nodes = nodes.to_crs(points.crs)
+
+# Main case: candidate lies inside a polygon
+inside = gpd.sjoin(
+    points,
+    nodes,
+    how="inner",
+    predicate="within"
+)
+
+inside["how"] = "within"
+inside["distance_m"] = 0.0
+
+# Fallback: candidates not inside any polygon
+outside = points[
+    ~points["cand_id"].isin(inside["cand_id"])
+].copy()
+
+# Project into metres for distance calculations
+outside_m = outside.to_crs(epsg=3035)
+nodes_m = nodes.to_crs(epsg=3035)
+
+# Find nearest polygon within 5 km
+near = gpd.sjoin_nearest(
+    outside_m,
+    nodes_m,
+    how="inner",
+    max_distance=5000,
+    distance_col="distance_m"
+)
+
+near = near.to_crs(points.crs)
+near["how"] = "nearest"
+
+# Combine both sets of spatial matches
+matches = pd.concat(
+    [inside, near],
+    ignore_index=True
+)
+
+print("Candidates matched to a polygon:",
+      matches["cand_id"].nunique())
+
+print("Candidates with no polygon within 5 km:",
+      len(points) - matches["cand_id"].nunique())
+
+
+# Now we check whether the missing unit's Wahlkreis agrees with the potential host polygon's Wahlkreis
+
+
+# --------------------------------------------------
+# 4. Wahlkreis referee
+# --------------------------------------------------
+
+# Compare candidate Wahlkreis with host Wahlkreis
+matches["wk_match"] = (
+    matches["wahlkreis"] == matches["host_wahlkreis"]
+)
+
+# Keep candidates whose host belongs to the correct Wahlkreis
+valid = matches[matches["wk_match"]].copy()
+
+# Remove duplicate candidate-host combinations
+valid = valid.drop_duplicates(
+    subset=["missing_unit_id", "node_id"]
+)
+
+# Count distinct valid host polygons for each missing unit
+host_counts = (
+    valid.groupby("missing_unit_id")["node_id"]
+    .nunique()
+    .rename("n_hosts")
+)
+
+valid = valid.merge(
+    host_counts,
+    on="missing_unit_id",
+    how="left"
+)
+
+# Automatically assign only units with exactly one valid host
+assigned = valid[
+    valid["n_hosts"] == 1
+].copy()
+
+assigned = assigned[
+    ["missing_unit_id", "node_id"]
+].drop_duplicates()
+
+# Everything else goes to manual review
+review = missing_units[
+    ~missing_units["missing_unit_id"].isin(assigned["missing_unit_id"])
+].copy()
+
+print("Automatically assigned units:", len(assigned))
+print("Units requiring manual review:", len(review))
+
+# Sanity checks
+assert assigned["missing_unit_id"].is_unique
+assert not assigned["node_id"].isna().any()
+
+assert (
+    len(assigned) + len(review)
+    == len(missing_units)
+)
+
+# Save results
+assigned.to_csv(
+    DIR + "missing_hosts_auto.csv",
+    index=False
+)
+
+review.to_csv(
+    DIR + "missing_hosts_review.csv",
+    index=False
+)
+
+
+manual = pd.read_csv(DIR + "manual_hosts.csv")
+auto = pd.read_csv(DIR + "missing_hosts_auto.csv")
+
+auto = auto[~auto["missing_unit_id"].isin(manual["missing_unit_id"])]    # manual wins
+hosts = pd.concat([auto, manual[["missing_unit_id", "node_id"]]])
+hosts = hosts[hosts["missing_unit_id"].isin(missing_units["missing_unit_id"])]   # only current missing units
+
+assert hosts["missing_unit_id"].is_unique
+assert set(hosts["missing_unit_id"]) == set(missing_units["missing_unit_id"])   # all 254 covered
+assert set(hosts["node_id"]) <= set(merged_geo_dissolved["unit_id"])             # every host is a real node
+
+
+# ------------------- 4.6 ----------------------------
+
+# Give every unit a node_id
+# Missing units use their assigned host's node_id
+# All other units keep their own unit_id as their node_id
+
+#1. Create a mapping from units to nodes
+unit_to_node=dict(zip(hosts["missing_unit_id"], hosts["node_id"]))
+
+kreis_map=lookup[["kreis_id", "unit_id"]].dropna().copy()
+
+#Start by giving every unit its own node_id
+kreis_map["node_id"]= kreis_map["unit_id"]
+
+#Replace the node_id fo th units that have been assigned a host
+kreis_map["node_id"]= kreis_map["unit_id"].map(unit_to_node).fillna(kreis_map["node_id"])
+
+assert kreis_map["unit_id"].nunique()==1003
+assert kreis_map["node_id"].nunique()==749
+
+#2. Match each Kreis to its node
+k= kreis_raw.merge(kreis_map, on="kreis_id")
+
+#3. Combine the election results for Kreise belonging to the same node
+vote_cols=[]
+
+for year in ["1928", "1930", "1932j"]:
+    vote_cols.append("eligible_"+year)
+    vote_cols.append("valid_"+year)
+    vote_cols.append("nsdap_"+year)
+
+#Add together the votes and population for each node
+node_data= k.groupby("node_id")[vote_cols + ["pop_1928"]].sum(min_count=1)
+node_data=node_data.reset_index()
+
+#Calculatethe NSDAP vote share for each election
+for year in ["1928", "1930", "1932j"]:
+    node_data["nsdap_share_" + year] = node_data["nsdap_" + year] / node_data["valid_" + year]
+
+
+#Check that combining Kreise hasn't changed the overall vote shares
+for year in  ["1928", "1930", "1932j"]:
+    total_votes_before=k["nsdap_"+ year].sum()
+    valid_votes_before=k["valid_"+year].sum()
+
+    total_votes_after= node_data["nsdap_"+ year].sum()
+    valid_votes_after=node_data["valid_"+year].sum()
+
+    before= total_votes_before/ valid_votes_before
+    after=total_votes_after/ valid_votes_after
+
+    print(year, round(before*100, 1), round(after*100, 1))
+
+    assert abs(before-after)<1e-9
+    assert node_data["nsdap_share_" + year].notna().all()
+
+
+#4. Calculate census shares for each node
+# Only include Kreise where both values are available
+
+def census_share(k, num, den):
+    valid_rows=k [k[num].notna() & k[den].notna()]
+
+    totals=valid_rows.groupby("node_id")[[num, den]].sum()
+
+    shares= totals[num]/totals[den]
+    return shares
+
+#Calculate Wahlkreis shares as a fallback formissing node data
+def wahlkreis_share(k, num, den):
+    valid_rows = k[k[num].notna() & k[den].notna()]
+
+    totals = valid_rows.groupby("wahlkreis")[[num, den]].sum()
+
+    shares = totals[num] / totals[den]
+
+    return shares
+
+
+
+#Assign each node to the Wahlkreis of its largest Kreis
+
+largest_kreis= k.sort_values("pop_1928", ascending=False)
+largest_kreis=largest_kreis.drop_duplicates("node_id")
+
+node_wk= largest_kreis.set_index("node_id")["wahlkreis"]
+node_data["wahlkreis"]=node_data["node_id"].map(node_wk)
+
+#Census variables and their numerator/denominator columns
+
+census= {
+    "catholic_share": ("c25_catholic", "c25_pop"),
+    "agri_share": ("c25_agri", "c25_occ_total"),
+    "unemp_1933": ("c33_unemployed", "c33_active")
+
+}
+
+for share, (num, den) in census.items():
+    #First try to calculate the share using the node's own Kreise
+
+    node_shares=census_share(k, num, den)
+    node_data[share]= node_data["node_id"].map(node_shares)
+
+    #Record which nodes have missing census data
+    node_data[share + "_approx"]= node_data[share].isna()
+
+    #For missing nodes, use the share from their Wahlkreis instead
+    wk_shares= wahlkreis_share(k, num, den)
+    fallback=node_data["wahlkreis"].map(wk_shares)
+
+    node_data[share]= node_data[share].fillna(fallback)
+
+    missing_count=node_data[share + "_approx"].sum()
+    print(share, missing_count, "nodes use the Wahlkreis value")
+
+    assert node_data[share].notna().all()
+
+assert len(node_data)==749
+
+
+# 5. Attach the node data to the geographic boundaries
+
+nodes_geo = merged_geo_dissolved[["unit_id", "geometry"]].copy()
+
+nodes_geo = nodes_geo.rename(columns={"unit_id": "node_id"})
+
+nodes_geo = nodes_geo.merge(node_data, on="node_id")
+
+assert len(nodes_geo) == 749
+
+#AI generated below this
+# 6. Save the results
+kreis_map.to_csv(DIR + "kreis_to_node.csv", index=False)
+node_data.to_csv(DIR + "nodes.csv", index=False)
+nodes_geo.to_file(DIR + "nodes.gpkg", driver="GPKG")
+
+    
+nodes_geo = gpd.read_file(DIR + "nodes.gpkg")
+nodes_geo.plot(column="nsdap_share_1932j", cmap="Reds", legend=True,
+               edgecolor="black", linewidth=0.1, figsize=(10, 12))
+plt.show()
